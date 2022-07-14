@@ -1,0 +1,334 @@
+local cycle_time = 0.03
+local up_ratio = 0.5
+local burst_ratio = 0.5
+
+local createJobManager = function ()
+
+end
+
+--[[
+"Class" which handles the running of time-limited processes called jobs.
+]]--
+local jobManager = {
+    jobs = {n = 0},
+    waitingList = {},
+    running = false,
+    --The time alloted for a full round of processing and idling
+    cycle_time = cycle_time,
+    --The amount of time in one cycle to take up with processing
+    up_time = cycle_time * up_ratio,
+    --The ratio of up time a single process can perform a CPU burst for
+    burst_time = cycle_time * up_ratio * burst_ratio,
+    name = "Test"
+}
+
+--[[
+Returns a queue with the given name and the functions push(), pop(), peek()
+and hasNext()
+]]--
+function jobManager.createJobQueue(name)
+    local queueName =  name
+    local output = {
+        name = queueName,
+        first = 1,
+        last = 1
+    }
+
+    function output:push(value)
+        self[self.last] = value
+        self.last = self.last + 1
+    end
+
+    function output:pop()
+        if (self.last > self.first) then
+            local output = self[self.first]
+            self[self.first] = nil
+            self.first = self.first + 1
+            return output
+        else
+            return nil
+        end
+    end
+
+    function output:peek()
+        if (self.last > self.first) then
+            return self[self.first]
+        else
+            return nil
+        end
+    end
+
+    function output:hasNext()
+        return (self.last > self.first)
+    end
+
+    return output
+end
+
+--[[
+Formats the default pass in for a job.
+]]--
+function jobManager.defaultPassIn(arg)
+    local inputValues = arg
+    if (inputValues == nil) then
+        inputValues = {}
+    end
+    return inputValues
+end
+
+--[[
+Formats the return from a resume call, removing the boolean for call status so
+that other functions don't have to handle it.
+]]--
+function jobManager.getResume(...)
+    local arg = {...}
+    local output = {}
+    if (arg ~= nil and arg[1] ~= nil and arg[1]) then
+        for index, value in ipairs(arg) do
+            if (index > 1) then
+                output[index - 1] = value
+            end
+        end
+        return true, output
+    elseif (arg ~= nil and arg[1] ~= nil and not arg[1]) then
+        output = {arg[2]}
+        return false, output
+    end
+    return false, output
+end
+
+--[[
+Creates a job that will run the input function, with the name provided. If a
+callback function is provided, that function will run after the job is completed
+passing in the job results.
+]]--
+function jobManager:createJob (func, name, callback, ...)
+    local arg = {...}
+    local job = {
+        name = name,
+        startTime = os.time(),
+        paused = false,
+        done = false,
+        waiting = false,
+        routine = coroutine.create(func),
+        callback = callback,
+        passIn = self.defaultPassIn(arg),
+    }
+    self:addJob(job)
+    return job.routine
+end
+
+--[[
+Adds a job to the ready queue, if this is the first job to be added, the kernel
+will also be initialized and then will begin its first cycle after a 1 frame
+delay.
+]]--
+function jobManager:addJob(job)
+    if (self["readyQueue"] == nil) then
+        self["readyQueue"] = self.createJobQueue("readyqueue")
+    end
+    self.jobs[job.routine] = job
+    self.readyQueue:push(job)
+    if (self.running == false) then
+        self.running = true
+        self["kernel"] = coroutine.create(function () self:run() end)
+        Wait.frames(function() self:resumeKernel() end, 1)
+    end
+end
+
+--[[
+The kernel process for the jobManager, endlessly runs, unless aborted externally.
+Will continue running jobs until the alloted time window runs out, then it Will
+pause to allow other functions to happen, and set a timer to resume itself after
+a small delay.
+]]--
+function jobManager:run()
+    local cycleCount = 0
+    --For logging
+    local cycleMax = 10
+    while(self.running) do
+        cycleCount = cycleCount + 1
+        local startTime = os.time()
+        local currentTime = os.time()
+        local diffTime = os.difftime(currentTime, startTime)
+        while (diffTime < self.up_time) do
+            currentTime = os.time()
+            diffTime = os.difftime(currentTime, startTime)
+            if (self.readyQueue:hasNext()) then
+                local currentJob = self.readyQueue:peek().routine
+                self:jobStart(currentJob)
+            else
+                break
+            end
+        end
+        currentTime = os.time()
+        diffTime = os.difftime(currentTime, startTime)
+        local remainingTime = self.cycle_time - diffTime
+        if (cycleCount < cycleMax) then
+            log("JOBMANAGER: Cycle ended, diffTime is "..(diffTime))
+            --log("JOBMANAGER: Cycle ended, remaining time is "..(remainingTime))
+        end
+        if remainingTime > 0 then
+            Wait.time(function() self:resumeKernel() end, remainingTime, 1)
+        else
+            local waitTime = cycle_time + (remainingTime * -1)
+            Wait.time(function() self:resumeKernel() end, waitTime, 1)
+        end
+        coroutine.yield()
+    end
+end
+
+function jobManager:resumeKernel()
+    self.paused = false
+    local status, err = coroutine.resume(self.kernel)
+    if (not status) then
+        log("JOBMANAGER: Error in job manager!")
+        log(err)
+    end
+end
+
+--[[
+Executes a job and handles the results
+]]--
+function jobManager:jobStart (key)
+    if not (self.jobs[key].done or self.jobs[key].waiting) then
+        self.jobs[key].startTime = os.time()
+        self.jobs[key]["passOut"] = {}
+        if (self.jobs[key]["passIn"] ~= nil and #self.jobs[key]["passIn"] > 0) then
+            local status, jobOutput = self.getResume(coroutine.resume(key, unpack(self.jobs[key]["passIn"])))
+            self.jobs[key]["passOut"] = jobOutput
+            if (coroutine.status(key) == "dead") then
+                if (not status) then
+                    log("JOBMANAGER: Error in resuming "..(self.jobs[key].name))
+                    log(jobOutput[1])
+                end
+                self:jobEnd(key)
+                return status
+            end
+            self.jobs[key]["passIn"] = self.defaultPassIn()
+        else
+            local status, jobOutput = self.getResume(coroutine.resume(key))
+            self.jobs[key]["passOut"] = jobOutput
+            if (coroutine.status(key) == "dead") then
+                if (not status) then
+                    log("JOBMANAGER: Error in resuming "..(self.jobs[key].name))
+                    log(jobOutput[1])
+                end
+                self:jobEnd(key)
+                return status
+            end
+        end
+    end
+end
+
+--[[
+Resumes a job, passing in any additional arguments to the corresponding wait
+]]--
+function jobManager:jobResume (key, ...)
+    local arg = {...}
+    if (self.jobs[key].waiting) then
+        self.jobs[key]["passIn"] = self.defaultPassIn(arg)
+        self.jobs[key].waiting = false
+        self.readyQueue:push(self.jobs[key])
+    end
+end
+
+--[[
+Called inside jobs, will automatically pause a job if it has spent too much
+time in its current execution.
+]]--
+function jobManager:timeout ()
+    local key = coroutine.running()
+    local currentTime = os.time()
+    if (os.difftime(currentTime, self.jobs[key].startTime) > self.burst_time) then
+        --log("JOBMANAGER: Timing out "..(self.jobs[key].name).."!")
+        local job = self.readyQueue:pop()
+        self.readyQueue:push(job)
+        coroutine.yield()
+    end
+end
+
+--[[
+Terminates a job, will signal to all waiting jobs and then will call a callback
+method if any.
+]]
+function jobManager:jobEnd (key)
+    self.jobs[key].done = true
+    self.readyQueue:pop()
+    self:signal(key)
+    if (self.jobs[key]["callback"] ~= nil) then
+        local callFunction = self.jobs[key]["callback"]
+        local callRoutine = coroutine.create(function ()
+            callFunction(unpack(self.jobs[key]["passOut"]))
+        end)
+        local status, err = coroutine.resume(callRoutine)
+        if (not status) then
+            log("JOBMANAGER: Error in callback for "..(self.jobs[key].name))
+            log(err)
+        end
+        self.jobs[key] = nil
+    end
+end
+
+--[[
+Retrieves the results of a finished job.
+]]--
+function jobManager:retrieveJobResults (key)
+    local output = nil
+    if (self.jobs[key]["passOut"] ~= nil) then
+        output = self.jobs[key]["passOut"]
+    end
+    if (self.jobs[key].done) then
+        self.jobs[key] = nil
+    end
+    if (output ~= nil) then
+        return unpack(output)
+    end
+    return output
+end
+
+--[[
+Tells the currently running job to wait to be resumed. If a job is passed in
+then the current job will be added to a waiting list for the job which was
+passed in. When that job completes, this function will automatically return
+the return value of that job.
+]]--
+function jobManager:wait(waitee)
+    local waiter = coroutine.running()
+    if (waitee ~= nil) then
+        if (not self.jobs[waitee].done) then
+            if (self.waitingList[waitee] == nil) then
+                self.waitingList[waitee] = self.createJobQueue("waitingList")
+                self.waitingList[waitee]:push(waiter)
+            else
+                self.waitingList[waitee]:push(waiter)
+            end
+            self.readyQueue:pop()
+            self.jobs[waiter].waiting = true
+            coroutine.yield()
+            return self:retrieveJobResults(waitee)
+        else
+            return self:retrieveJobResults(waitee)
+        end
+    else
+        self.readyQueue:pop()
+        self.jobs[waiter].waiting = true
+        coroutine.yield()
+        return unpack(self.jobs[waiter].passIn)
+    end
+end
+
+--[[
+Signals to all processes waiting on the passed in job that the job
+has finished, and the waiting processes can now request results.
+]]--
+function jobManager:signal(key)
+    if (self.waitingList[key] ~= nil) then
+        while (self.waitingList[key]:hasNext()) do
+            local jobKey = self.waitingList[key]:pop()
+            local outputVals = self.jobs[key]["passOut"]
+            self:jobResume(jobKey,outputVals)
+        end
+        self.waitingList[key] = nil
+    end
+end
